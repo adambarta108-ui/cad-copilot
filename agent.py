@@ -13,6 +13,10 @@ from sw_bridge import MockBridge, SolidWorksBridge, SolidWorksError
 MODEL = "claude-opus-5"
 MAX_STEPS = 30  # API calls per request before pausing, so a stuck loop can't run up the bill
 
+# Models offered in the app, with $ per million input / output tokens
+MODELS = {"claude-opus-5": "Claude Opus 5 (best results)", "claude-sonnet-5": "Claude Sonnet 5 (cheaper)"}
+PRICES = {"claude-opus-5": (5.00, 25.00), "claude-sonnet-5": (2.00, 10.00)}
+
 SYSTEM_PROMPT = """You are CAD Copilot, an assistant that builds and edits parts in SolidWorks
 by calling tools. The user describes what they want in plain English; you turn it
 into a sequence of modelling operations.
@@ -227,36 +231,77 @@ def drop_old_screenshots(messages):
         block["content"] = "[Earlier screenshot removed to save tokens.]"
 
 
-def run_turn(client, bridge, messages):
-    """Let Claude call tools until it has finished answering the latest user message."""
+def request_cost(model, usage):
+    """Dollar cost of one API call, from the usage the API reports."""
+    if usage is None:
+        return 0.0
+    price_in, price_out = PRICES.get(model, PRICES[MODEL])
+    tokens_in = (
+        (usage.input_tokens or 0)
+        + 1.25 * (getattr(usage, "cache_creation_input_tokens", 0) or 0)  # cache writes cost 25% more
+        + 0.10 * (getattr(usage, "cache_read_input_tokens", 0) or 0)  # cache reads cost 90% less
+    )
+    return (tokens_in * price_in + (usage.output_tokens or 0) * price_out) / 1_000_000
+
+
+def print_event(kind, **data):
+    """Default event handler: show progress in the terminal."""
+    if kind == "text":
+        print(f"\ncopilot> {data['text']}")
+    elif kind == "tool_call":
+        print(f"  -> {data['name']}({json.dumps(data['input'])})")
+    elif kind == "tool_result":
+        print(f"     {data['text']}")
+    elif kind == "notice":
+        print(f"\ncopilot> ({data['text']})")
+
+
+def run_turn(client, bridge, messages, emit=print_event, should_stop=lambda: False, model=MODEL):
+    """Let Claude call tools until it has finished answering the latest user message.
+
+    Progress is reported through emit(kind, **data), so the same loop can drive
+    the terminal or the desktop app. Returns the dollar cost of the turn.
+    """
+    cost = 0.0
     for _ in range(MAX_STEPS):
+        if should_stop():
+            emit("notice", text="Stopped.")
+            return cost
         drop_old_screenshots(messages)
+        extra = {}
+        if model == MODEL:
+            # If Opus declines a request, the API retries it on a fallback model instead of stopping.
+            extra = {"betas": ["server-side-fallback-2026-07-01"], "extra_body": {"fallbacks": "default"}}
         response = client.beta.messages.create(
-            model=MODEL,
+            model=model,
             max_tokens=16000,
             thinking={"type": "adaptive"},
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages,
             cache_control={"type": "ephemeral"},  # reuse the unchanged history at ~10% of the price
-            # If Opus declines a request, the API retries it on a fallback model instead of stopping.
-            betas=["server-side-fallback-2026-07-01"],
-            extra_body={"fallbacks": "default"},
+            **extra,
         )
         messages.append({"role": "assistant", "content": response.content})
+        cost += request_cost(model, getattr(response, "usage", None))
+        emit("cost", turn=cost)
 
         for block in response.content:
             if block.type == "text" and block.text.strip():
-                print(f"\ncopilot> {block.text}")
+                emit("text", text=block.text)
 
         if response.stop_reason == "tool_use":
             results = []
             for block in response.content:
                 if block.type != "tool_use":
                     continue
-                print(f"  -> {block.name}({json.dumps(block.input)})")
+                emit("tool_call", name=block.name, input=block.input)
                 content, is_error = run_tool(bridge, block.name, block.input)
-                print(f"     {content if isinstance(content, str) else '[image]'}")
+                image = None
+                if isinstance(content, list):
+                    image = next((b["source"]["data"] for b in content if b.get("type") == "image"), None)
+                emit("tool_result", name=block.name, is_error=is_error, image=image,
+                     text=content if isinstance(content, str) else "[image]")
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -267,12 +312,13 @@ def run_turn(client, bridge, messages):
             continue
 
         if response.stop_reason == "refusal":
-            print("\ncopilot> (The model declined this request.)")
+            emit("notice", text="The model declined this request.")
         elif response.stop_reason == "max_tokens":
-            print("\ncopilot> (Response was cut off. Try a smaller request.)")
-        return
+            emit("notice", text="Response was cut off. Try a smaller request.")
+        return cost
 
-    print(f"\ncopilot> (Stopped after {MAX_STEPS} steps to limit cost. Say 'continue' to keep going.)")
+    emit("notice", text=f"Stopped after {MAX_STEPS} steps to limit cost. Say 'continue' to keep going.")
+    return cost
 
 
 def main():

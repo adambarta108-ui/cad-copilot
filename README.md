@@ -1,64 +1,69 @@
 # CAD Copilot
 
-Describe a part in plain English and let Claude build it in SolidWorks.
+Describe a part in plain English and Claude builds it in SolidWorks, step by step, then looks at the result to check it.
 
-```
-you> make an 80x50x6 mm mounting plate with 4 corner holes, 5 mm dia, 8 mm in from each edge
-  -> new_part({})
-  -> create_sketch({"plane": "top", "shapes": [{"type": "rectangle", "x1": -40, "y1": -25, "x2": 40, "y2": 25}]})
-  -> extrude({"sketch": "Sketch1", "depth": 6})
-  -> create_sketch({"plane": "top", "shapes": [{"type": "circle", "cx": -32, "cy": -17, "r": 2.5}, ...]})
-  -> cut({"sketch": "Sketch2", "through_all": true})
-copilot> Built an 80 x 50 x 6 mm plate with four Ø5 mm through holes...
-```
+> "A 100×60×20 mm tray with 2 mm walls, open at the top, with 5 mm rounded corners"
+
+<img src="assets/tray.png" alt="A rounded tray built by CAD Copilot in SolidWorks" width="480">
+
+## Download and use
+
+1. Download **CADCopilot.exe** from the [Releases page](../../releases/latest) and double-click it.
+   Windows may show "Windows protected your PC" because the app isn't code-signed yet. Click **More info → Run anyway**.
+2. The first time, paste an **Anthropic API key**. Create one at [console.anthropic.com](https://console.anthropic.com/settings/keys) and add some credit. The key is stored in Windows Credential Manager, and you pay Anthropic directly for what you use. The top bar shows what the current chat has cost.
+3. Type what you want to build, or click one of the examples.
+
+**Requirements:** Windows 10 or 11. SolidWorks (tested with 2025) for building real parts; without it, **Demo** mode shows every step Claude plans without building anything.
+
+Parts you ask to save go to `Documents\CAD Copilot Parts`.
+
+### Things to try
+
+- "An 80×50×6 mm plate with four 5 mm holes, 8 mm in from each edge"
+- "A 20 mm diameter shaft, 80 mm long, with a 1 mm chamfer on both ends"
+- "A 60 mm disc, 8 mm thick, with six 5 mm holes on a 45 mm bolt circle"
+- "Now add 1 mm fillets to the top edges" (follow-ups edit the same part)
+- "Save it as bracket.STEP"
 
 ## How it works
 
 ```
-you ──text──> agent.py ──(tools)──> Claude API
-                 │  <──tool calls───────┘
-                 v
-            sw_bridge.py ──COM (pywin32)──> SolidWorks
+ you ──> app window (ui/index.html, pywebview)
+             │
+             v
+          agent.py ──── tools ────> Claude API
+             │  <─── tool calls ──────┘
+             v
+        sw_bridge.py ── COM (pywin32) ──> SolidWorks
 ```
 
-- **agent.py** holds the tool definitions, the system prompt, and the agent loop. Claude decides which tools to call, the loop runs them and sends back the results, and it repeats until the part is done.
-- **Tools**: new part, sketch (rectangles, circles, lines, centerlines), extrude, cut, revolve, fillet, chamfer, shell, model info (feature tree, bounding box, mass), screenshot, undo, save/export.
-- **Self-check**: after building, Claude takes an isometric screenshot and looks at it to confirm the part matches the request.
-- **sw_bridge.py** maps each tool onto SolidWorks API calls (`SketchManager`, `FeatureManager.FeatureExtrusion2`, `FeatureCut4`, and so on). Errors go back to Claude as text so it can correct itself.
-- **MockBridge** has the same interface with no SolidWorks behind it, so you can work on prompts and the loop from any computer.
+- **agent.py**: the tool definitions, system prompt and agent loop. Claude picks a tool, the loop runs it and sends back the result, and it repeats until the part is done. It also enforces cost limits: prompt caching, only the newest screenshot is resent, and a maximum of 30 steps per request.
+- **Tools**: new part, sketch (rectangles, circles, lines, centerlines), extrude, cut, revolve, fillet, chamfer, shell, model info (feature tree, bounding box, volume), screenshot, undo, save/export.
+- **sw_bridge.py**: turns each tool into SolidWorks API calls. Edges and faces are found from the actual geometry, so hidden ones can be picked too. Errors go back to Claude as text so it can correct itself. `MockBridge` is the Demo-mode stand-in.
+- **app.py**: the desktop app. Runs the agent on one background thread (SolidWorks' COM interface is thread-bound) and streams progress to the window.
 
-## Setup
+## Development
 
-1. Install Python 3.10+ from python.org (tick "Add to PATH").
-2. `pip install -r requirements.txt`
-3. Get an API key at console.anthropic.com and set it:
-   `setx ANTHROPIC_API_KEY "sk-ant-..."` (open a new terminal afterwards).
-4. Check everything works (offline, free): `python -m unittest test_agent`
-5. Run it:
-   - `python agent.py --mock` works anywhere, no SolidWorks needed.
-   - `python agent.py` needs SolidWorks installed; it connects to the running copy or starts one.
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python -m unittest test_agent     # offline tests, free
+.venv\Scripts\python app.py                     # desktop app
+.venv\Scripts\python agent.py --mock            # terminal version, no SolidWorks
+powershell -ExecutionPolicy Bypass -File build.ps1   # builds dist\CADCopilot.exe
+```
 
-## Things to try
+The terminal version reads the key from the `ANTHROPIC_API_KEY` environment variable.
 
-- "Make a 40 mm cube with a 10 mm hole through the middle"
-- "Build a 100x60x20 mm box and shell it to a tray with 2 mm walls, open at the top"
-- "Make a 20 mm diameter, 80 mm long shaft with a 1 mm chamfer on both ends" (uses revolve)
-- "Add 3 mm fillets to the four vertical edges"
-- "Put 6 M5 clearance holes on a 60 mm bolt circle" (Claude works out the positions itself)
-- "Add an M8 thread to the shaft" (there's no thread tool, so it should say so)
-- "Save it as bracket.STEP"
+## Roadmap
 
-## Roadmap ideas (good portfolio material)
-
-1. **More tools**: linear/circular pattern, mirror, and reference planes. Each is one bridge method plus one tool entry.
-2. **Smarter selection**: pick faces and edges by description ("the top face") in place of 3D points.
-3. **Parametric edits**: read and change dimensions by name ("make the plate 10 mm longer").
-4. **Other CAD backends**: write an `InventorBridge` or `FusionBridge` with the same methods; agent.py doesn't change.
-5. **In-app UI**: a SolidWorks task-pane add-in (C#) or a small web UI in place of the terminal.
-6. **MCP server**: expose the bridge as an MCP server so Claude Desktop or Claude Code can drive SolidWorks directly.
+1. **More tools**: linear/circular patterns, mirror, reference planes, threads.
+2. **Smarter selection**: pick faces and edges by description ("the top face") in place of coordinates.
+3. **Parametric edits**: change dimensions by name ("make the plate 10 mm longer").
+4. **Other CAD programs**: an `InventorBridge` or `FusionBridge` with the same methods; the agent doesn't change.
+5. **Code signing and an installer**, so Windows stops warning on first launch.
 
 ## Known limitations
 
-- Tested on SOLIDWORKS 2025: sketch, extrude, fillet, shell, revolve, chamfer, model info and screenshot all work.
-- Edges and faces are picked by 3D points. The bridge finds the nearest edge or face in the actual geometry (within 0.5 mm), so hidden edges work too, but Claude still has to work out the coordinates. That's fine for simple prismatic and turned parts.
-- Cost: each request resends the conversation. Prompt caching, dropping old screenshots and a 30-step cap per request keep this in check, but a long session with many parts still adds up. Start a fresh session for each new part.
+- Claude works out edge and face positions from coordinates, which is reliable for block-like and turned parts but gets harder for complex shapes.
+- Each request resends the conversation, so long chats cost more. Start a **New chat** for each new part.

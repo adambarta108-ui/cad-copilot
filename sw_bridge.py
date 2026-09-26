@@ -26,6 +26,36 @@ class SolidWorksError(RuntimeError):
     pass
 
 
+def solidworks_installed():
+    """True if SolidWorks has registered its automation interface on this PC."""
+    try:
+        import winreg
+        winreg.CloseKey(winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"SldWorks.Application\CLSID"))
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+def parts_folder(create=True):
+    """Documents\\CAD Copilot Parts: where saves with a bare filename end up."""
+    documents = os.path.join(os.path.expanduser("~"), "Documents")
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0:  # CSIDL_PERSONAL
+            documents = buf.value  # respects OneDrive / redirected Documents folders
+    except (AttributeError, OSError):
+        pass
+    folder = os.path.join(documents, "CAD Copilot Parts")
+    if create:
+        os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _resolve_save_path(path, create=True):
+    return path if os.path.isabs(path) else os.path.join(parts_folder(create), path)
+
+
 def _mm(point):
     return [v * MM for v in point]
 
@@ -278,7 +308,7 @@ class SolidWorksBridge:
         return f"Undid {steps} step(s)."
 
     def save(self, path):
-        path = os.path.abspath(path)
+        path = _resolve_save_path(path)
         err = self.model.SaveAs3(path, 0, SAVE_SILENT)
         if err != 0:
             raise SolidWorksError(f"Save failed with SolidWorks error code {err}.")
@@ -367,5 +397,6 @@ class MockBridge:
         return f"Undid {steps} step(s)."
 
     def save(self, path):
+        path = _resolve_save_path(path, create=False)
         self._log(f"save to {path}")
-        return f"Saved to {os.path.abspath(path)}."
+        return f"(Demo mode: nothing was written.) Would have saved to {path}."
