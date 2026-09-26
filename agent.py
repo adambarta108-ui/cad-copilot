@@ -11,6 +11,7 @@ import anthropic
 from sw_bridge import MockBridge, SolidWorksBridge, SolidWorksError
 
 MODEL = "claude-opus-5"
+MAX_STEPS = 30  # API calls per request before pausing, so a stuck loop can't run up the bill
 
 SYSTEM_PROMPT = """You are CAD Copilot, an assistant that builds and edits parts in SolidWorks
 by calling tools. The user describes what they want in plain English; you turn it
@@ -212,9 +213,24 @@ def run_tool(bridge, name, args):
         return f"Error ({type(e).__name__}): {e}", True
 
 
+def drop_old_screenshots(messages):
+    """Keep only the newest screenshot in the history; every image is resent on every request."""
+    image_results = [
+        block
+        for m in messages if m["role"] == "user" and isinstance(m["content"], list)
+        for block in m["content"]
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+        and isinstance(block["content"], list)
+        and any(b.get("type") == "image" for b in block["content"])
+    ]
+    for block in image_results[:-1]:
+        block["content"] = "[Earlier screenshot removed to save tokens.]"
+
+
 def run_turn(client, bridge, messages):
     """Let Claude call tools until it has finished answering the latest user message."""
-    while True:
+    for _ in range(MAX_STEPS):
+        drop_old_screenshots(messages)
         response = client.beta.messages.create(
             model=MODEL,
             max_tokens=16000,
@@ -222,6 +238,7 @@ def run_turn(client, bridge, messages):
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages,
+            cache_control={"type": "ephemeral"},  # reuse the unchanged history at ~10% of the price
             # If Opus declines a request, the API retries it on a fallback model instead of stopping.
             betas=["server-side-fallback-2026-07-01"],
             extra_body={"fallbacks": "default"},
@@ -254,6 +271,8 @@ def run_turn(client, bridge, messages):
         elif response.stop_reason == "max_tokens":
             print("\ncopilot> (Response was cut off. Try a smaller request.)")
         return
+
+    print(f"\ncopilot> (Stopped after {MAX_STEPS} steps to limit cost. Say 'continue' to keep going.)")
 
 
 def main():

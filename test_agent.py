@@ -117,6 +117,28 @@ class RunTurnTests(unittest.TestCase):
         results = messages[2]["content"]
         self.assertEqual([r["tool_use_id"] for r in results], ["a", "b"])
 
+    def test_step_limit_stops_a_runaway_loop(self):
+        client = FakeClient([
+            NS(stop_reason="tool_use", content=[tool_use(f"t{i}", "undo")]) for i in range(agent.MAX_STEPS)
+        ])
+        with redirect_stdout(io.StringIO()) as out:
+            agent.run_turn(client, MockBridge(), [{"role": "user", "content": "x"}])
+        self.assertEqual(len(client.requests), agent.MAX_STEPS)
+        self.assertIn("Stopped after", out.getvalue())
+
+    def test_only_the_newest_screenshot_is_kept(self):
+        image = [{"type": "image", "source": {}}, {"type": "text", "text": "view"}]
+        messages = [
+            {"role": "user", "content": "go"},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": list(image)}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b", "content": "ok"}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c", "content": list(image)}]},
+        ]
+        agent.drop_old_screenshots(messages)
+        self.assertIsInstance(messages[1]["content"][0]["content"], str)
+        self.assertEqual(messages[2]["content"][0]["content"], "ok")
+        self.assertEqual(messages[3]["content"][0]["content"], image)
+
     def test_refusal_stops_the_turn(self):
         client = FakeClient([NS(stop_reason="refusal", content=[])])
         with redirect_stdout(io.StringIO()) as out:

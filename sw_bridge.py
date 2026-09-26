@@ -9,8 +9,10 @@ import io
 import math
 import os
 import tempfile
+import types
 
 MM = 0.001  # the SolidWorks API works in metres
+PICK_TOLERANCE = 0.5 * MM  # how close a point must be to count as "on" an edge or face
 
 PLANES = {"front": "Front Plane", "top": "Top Plane", "right": "Right Plane"}
 
@@ -26,6 +28,17 @@ class SolidWorksError(RuntimeError):
 
 def _mm(point):
     return [v * MM for v in point]
+
+
+def _call(obj, name):
+    """Call a no-argument COM method.
+
+    With late binding, pywin32 sometimes exposes these as properties (already
+    invoked, so adding () raises 'Member not found') and sometimes as methods,
+    depending on the object. This handles both.
+    """
+    attr = getattr(obj, name)
+    return attr() if isinstance(attr, types.MethodType) else attr
 
 
 class SolidWorksBridge:
@@ -55,6 +68,33 @@ class SolidWorksBridge:
         if not ok:
             raise SolidWorksError(f"Could not select {kind} '{name}' at ({x}, {y}, {z}) m.")
 
+    def _select_nearest(self, kind, point, mark=0):
+        """Add the edge or face lying at `point` (mm) to the selection.
+
+        Works from the geometry itself, so unlike SelectByID2 it can pick
+        entities that are hidden from the current view.
+        """
+        target = _mm(point)
+        getter = "GetEdges" if kind == "EDGE" else "GetFaces"
+        candidates = [e for body in (self.model.GetBodies2(0, False) or ()) for e in (_call(body, getter) or ())]
+        if not candidates:
+            raise SolidWorksError("There is no solid body to pick from yet.")
+
+        def distance(entity):
+            return math.dist(entity.GetClosestPointOn(*target)[:3], target)
+
+        best = min(candidates, key=distance)
+        gap = distance(best)
+        if gap > PICK_TOLERANCE:
+            raise SolidWorksError(
+                f"No {kind.lower()} at {point}; the nearest one is {gap / MM:.2f} mm away. "
+                "Use get_model_info to check the geometry."
+            )
+        select_data = _call(self.model.SelectionManager, "CreateSelectData")
+        select_data.Mark = mark
+        if not best.Select4(True, select_data):
+            raise SolidWorksError(f"Found the {kind.lower()} at {point} but could not select it.")
+
     def _last_feature_name(self):
         return self.model.FeatureByPositionReverse(0).Name
 
@@ -78,7 +118,7 @@ class SolidWorksBridge:
         m = self.model
         m.ClearSelection2(True)
         if face_point:
-            self._select("", "FACE", *_mm(face_point))
+            self._select_nearest("FACE", face_point)
         else:
             self._select(PLANES[(plane or "front").lower()], "PLANE")
 
@@ -141,7 +181,7 @@ class SolidWorksBridge:
     def fillet(self, radius, edge_points):
         self.model.ClearSelection2(True)
         for p in edge_points:
-            self._select("", "EDGE", *_mm(p), append=True, mark=1)
+            self._select_nearest("EDGE", p, mark=1)
         n = self._nothing
         feature = self.model.FeatureManager.FeatureFillet3(
             195, radius * MM, radius * MM, 0, 0, 0, 0, n, n, n, n, n, n, n
@@ -165,7 +205,7 @@ class SolidWorksBridge:
     def chamfer(self, distance, edge_points, angle=45):
         self.model.ClearSelection2(True)
         for p in edge_points:
-            self._select("", "EDGE", *_mm(p), append=True, mark=1)
+            self._select_nearest("EDGE", p, mark=1)
         feature = self.model.FeatureManager.InsertFeatureChamfer(
             4, 1,  # options, swChamferAngleDistance
             distance * MM, math.radians(angle), 0, 0, 0, 0,
@@ -176,7 +216,7 @@ class SolidWorksBridge:
         m = self.model
         m.ClearSelection2(True)
         for p in face_points:
-            self._select("", "FACE", *_mm(p), append=True, mark=1)
+            self._select_nearest("FACE", p, mark=1)
         before = self._last_feature_name()
         m.InsertFeatureShell(thickness * MM, outward)  # returns nothing, so check the tree instead
         after = self._last_feature_name()
@@ -191,7 +231,8 @@ class SolidWorksBridge:
 
         m = self.model
         m.ShowNamedView2("*Isometric", 7)  # swIsometricView
-        m.ViewZoomtofit2()
+        _call(m, "ViewZoomtofit2")
+        _call(m, "ViewZoomout")  # the image aspect differs from the window, so leave a margin
         path = os.path.join(tempfile.gettempdir(), "cad_copilot_view.bmp")
         if not m.SaveBMP(path, 1024, 768):
             raise SolidWorksError("Could not capture the view.")
@@ -208,12 +249,12 @@ class SolidWorksBridge:
     def get_model_info(self):
         m = self.model
         lines = ["Features:"]
-        feat = m.FirstFeature()
+        feat = _call(m, "FirstFeature")
         while feat is not None:
-            kind = feat.GetTypeName2()
+            kind = _call(feat, "GetTypeName2")
             if not kind.endswith("Folder") and kind != "DetailCabinet":
                 lines.append(f"  - {feat.Name} ({kind})")
-            feat = feat.GetNextFeature()
+            feat = _call(feat, "GetNextFeature")
 
         try:
             box = m.GetPartBox(True)  # (xmin, ymin, zmin, xmax, ymax, zmax) in metres
@@ -224,9 +265,10 @@ class SolidWorksBridge:
         except Exception:
             pass
 
-        mp = m.Extension.CreateMassProperty()
+        mp = _call(m.Extension, "CreateMassProperty")
         if mp is not None:
-            lines.append(f"Volume: {mp.Volume * 1e9:.1f} mm^3, mass: {mp.Mass:.4f} kg")
+            mass = f"{mp.Mass * 1000:.1f} g" if mp.Mass > 0 else "unknown (no material assigned)"
+            lines.append(f"Volume: {mp.Volume * 1e9:.1f} mm^3, mass: {mass}")
         else:
             lines.append("No solid body yet.")
         return "\n".join(lines)

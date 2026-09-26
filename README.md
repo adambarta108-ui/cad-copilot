@@ -59,5 +59,6 @@ you ──text──> agent.py ──(tools)──> Claude API
 
 ## Known limitations
 
-- The agent loop and mock mode pass the offline tests, but nothing has been run against the real API or a live SolidWorks yet. The SolidWorks COM calls follow the documented API but haven't been tried against a live install. `fillet` (optional array arguments), `chamfer` and `shell` are the most likely to need adjusting.
-- Edges and faces are picked by 3D points, so Claude needs `get_model_info` (bounding box) to find them. That works for simple prismatic parts.
+- Tested on SOLIDWORKS 2025: sketch, extrude, fillet, shell, revolve, chamfer, model info and screenshot all work.
+- Edges and faces are picked by 3D points. The bridge finds the nearest edge or face in the actual geometry (within 0.5 mm), so hidden edges work too, but Claude still has to work out the coordinates. That's fine for simple prismatic and turned parts.
+- Cost: each request resends the conversation. Prompt caching, dropping old screenshots and a 30-step cap per request keep this in check, but a long session with many parts still adds up. Start a fresh session for each new part.
